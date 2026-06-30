@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -73,10 +74,16 @@ type PooledConn struct {
 	createdAt time.Time
 }
 
-type ProxyPool struct {
+type ProxyBucket struct {
 	mu         sync.Mutex
-	conns      map[string]chan PooledConn
-	lastActive map[string]time.Time
+	ch         chan PooledConn
+	lastActive time.Time
+	dialing    int32
+}
+
+type ProxyPool struct {
+	mu      sync.RWMutex
+	buckets map[string]*ProxyBucket
 }
 
 var (
@@ -84,10 +91,30 @@ var (
 	proxyMapMutex sync.RWMutex
 
 	globalPool = &ProxyPool{
-		conns:      make(map[string]chan PooledConn),
-		lastActive: make(map[string]time.Time),
+		buckets: make(map[string]*ProxyBucket),
 	}
 )
+
+func (p *ProxyPool) getBucket(key string) *ProxyBucket {
+	p.mu.RLock()
+	b, exists := p.buckets[key]
+	p.mu.RUnlock()
+	if exists {
+		return b
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	b, exists = p.buckets[key]
+	if !exists {
+		b = &ProxyBucket{
+			ch:         make(chan PooledConn, 3),
+			lastActive: time.Now(),
+		}
+		p.buckets[key] = b
+	}
+	return b
+}
 
 type Client struct {
 	file          string
@@ -198,18 +225,29 @@ func (c *Client) watchProxiesFile() {
 func (p *ProxyPool) cleanupWorker(c *Client) {
 	for {
 		time.Sleep(5 * time.Second)
-		p.mu.Lock()
 		now := time.Now()
-		for key, ch := range p.conns {
-			size := len(ch)
+
+		p.mu.RLock()
+		buckets := make([]*ProxyBucket, 0, len(p.buckets))
+		for _, b := range p.buckets {
+			buckets = append(buckets, b)
+		}
+		p.mu.RUnlock()
+
+		for _, b := range buckets {
+			b.mu.Lock()
+			lastActive := b.lastActive
+			b.mu.Unlock()
+
+			size := len(b.ch)
 			for i := 0; i < size; i++ {
 				select {
-				case pc := <-ch:
-					if now.Sub(pc.createdAt) > 10*time.Second {
+				case pc := <-b.ch:
+					if now.Sub(pc.createdAt) > 10*time.Second || now.Sub(lastActive) > 60*time.Second {
 						pc.conn.Close()
 					} else {
 						select {
-						case ch <- pc:
+						case b.ch <- pc:
 						default:
 							pc.conn.Close()
 						}
@@ -217,27 +255,7 @@ func (p *ProxyPool) cleanupWorker(c *Client) {
 				default:
 				}
 			}
-			
-			lastUse, exists := p.lastActive[key]
-			if exists && now.Sub(lastUse) > 60*time.Second {
-				closeChan := p.conns[key]
-				delete(p.conns, key)
-				delete(p.lastActive, key)
-				go func(c chan PooledConn) {
-					for {
-						select {
-						case pc := <-c:
-							if pc.conn != nil {
-								pc.conn.Close()
-							}
-						default:
-							return
-						}
-					}
-				}(closeChan)
-			}
 		}
-		p.mu.Unlock()
 	}
 }
 
@@ -282,10 +300,8 @@ func getUserProxyConfig(userID string, country string) (bool, ProxyList, error) 
 	}
 
 	if global.MultiProxy != nil {
-		for _, plist := range global.MultiProxy {
-			if len(plist) > 0 {
-				return true, plist, nil
-			}
+		if plist, ok := global.MultiProxy[country]; ok && len(plist) > 0 {
+			return true, plist, nil
 		}
 	}
 
@@ -298,42 +314,49 @@ func getUserProxyConfig(userID string, country string) (bool, ProxyList, error) 
 
 func (p *ProxyPool) Get(proxy *ProxyParams, targetHost string, targetPort uint16) (std_net.Conn, error) {
 	key := fmt.Sprintf("%s:%s:%d:%s:%s", proxy.Type, proxy.Host, proxy.Port, proxy.User, proxy.Pass)
-	
-	p.mu.Lock()
-	p.lastActive[key] = time.Now()
-	ch, exists := p.conns[key]
-	if !exists {
-		ch = make(chan PooledConn, 3)
-		p.conns[key] = ch
-	}
-	p.mu.Unlock()
+	b := p.getBucket(key)
+
+	b.mu.Lock()
+	b.lastActive = time.Now()
+	b.mu.Unlock()
 
 	for {
 		select {
-		case pc := <-ch:
-			if isConnAlive(pc.conn) {
-				go p.replenish(proxy, key, ch)
+		case pc := <-b.ch:
+			if time.Since(pc.createdAt) < 10*time.Second && isConnAlive(pc.conn) {
+				go p.replenish(proxy, b)
 				return p.finalizeConnection(pc.conn, proxy, targetHost, targetPort)
 			}
 			pc.conn.Close()
 		default:
+			go p.replenish(proxy, b)
 			return dialAndEstablishProxy(proxy, targetHost, targetPort)
 		}
 	}
 }
 
-func (p *ProxyPool) replenish(proxy *ProxyParams, key string, ch chan PooledConn) {
-	p.mu.Lock()
-	lastUse := p.lastActive[key]
-	p.mu.Unlock()
-
+func (p *ProxyPool) replenish(proxy *ProxyParams, b *ProxyBucket) {
+	b.mu.Lock()
+	lastUse := b.lastActive
 	if time.Since(lastUse) > 30*time.Second {
+		b.mu.Unlock()
 		return
 	}
 
-	if len(ch) >= cap(ch) {
+	if atomic.LoadInt32(&b.dialing) >= 1 {
+		b.mu.Unlock()
 		return
 	}
+
+	if len(b.ch)+int(atomic.LoadInt32(&b.dialing)) >= cap(b.ch) {
+		b.mu.Unlock()
+		return
+	}
+
+	atomic.AddInt32(&b.dialing, 1)
+	b.mu.Unlock()
+
+	defer atomic.AddInt32(&b.dialing, -1)
 
 	conn, err := prewarmConnection(proxy)
 	if err != nil {
@@ -341,7 +364,7 @@ func (p *ProxyPool) replenish(proxy *ProxyParams, key string, ch chan PooledConn
 	}
 
 	select {
-	case ch <- PooledConn{conn: conn, createdAt: time.Now()}:
+	case b.ch <- PooledConn{conn: conn, createdAt: time.Now()}:
 	default:
 		conn.Close()
 	}
