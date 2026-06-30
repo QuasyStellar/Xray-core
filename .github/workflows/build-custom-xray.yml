@@ -1,0 +1,48 @@
+name: Build Custom Xray Core
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - custom-core
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux]
+        goarch: [amd64, arm64]
+    
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Get project dependencies
+        run: go mod download
+
+      - name: Build Xray
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p build_assets
+          COMMIT_ID=$(git describe --always --dirty)
+          go build -o build_assets/xray -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMIT_ID} -s -w -buildid=" -v ./main
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ./build_assets/xray

@@ -15,6 +15,8 @@ import (
 	"github.com/xtls/xray-core/common/serial"
 	core "github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/transport/internet"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 var (
@@ -42,6 +44,7 @@ var (
 		"http":        func() interface{} { return new(HTTPClientConfig) },
 		"shadowsocks": func() interface{} { return new(ShadowsocksClientConfig) },
 		"socks":       func() interface{} { return new(SocksClientConfig) },
+		"remnasocks":  func() interface{} { return new(RemnasocksClientConfig) },
 		"vless":       func() interface{} { return new(VLessOutboundConfig) },
 		"vmess":       func() interface{} { return new(VMessOutboundConfig) },
 		"trojan":      func() interface{} { return new(TrojanClientConfig) },
@@ -634,4 +637,11 @@ func ParseSendThough(Addr *string) *Address {
 	var addr Address
 	addr.Address = net.ParseAddress(strings.Split(*Addr, "/")[0])
 	return &addr
+}
+
+type RemnasocksClientConfig struct {
+}
+
+func (v *RemnasocksClientConfig) Build() (proto.Message, error) {
+	return &emptypb.Empty{}, nil
 }
